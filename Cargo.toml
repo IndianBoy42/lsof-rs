@@ -1,0 +1,27 @@
+[package]
+name = "lsof-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.4", features = ["cargo"] }
+fxhash = "0.2.1"
+glob = "0.3.1"
+itertools = "0.13.0"
+rayon = "1.10.0"
+smallvec = "1.13.2"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+tracing-timing = "0.6.0"
+tracing-tracy = "0.11.0"
+tracing-coz = "0.1.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "lsof"
+harness = false
