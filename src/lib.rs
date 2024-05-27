@@ -6,7 +6,6 @@ use itertools::chain;
 use std::fs::read_to_string;
 use std::{fs, path::Component};
 
-pub type Pids = FSet<u64>; // PERF: can be Vec because small?
 pub type Filenames = FSet<String>;
 pub type PidMap = FMap<u64, Procinfo>;
 
@@ -32,13 +31,13 @@ pub struct LsofData {
     // pid => info
     pid_to_files: PidMap,
     // file => pid
-    files_to_pid: FMap<String, Pids>,
+    files_to_pid: FMap<String, FSet<u64>>, // PERF: can be Vec because small?>
 }
 
 ///get all infomation
 #[tracing::instrument(level = "info")]
-pub fn lsof() -> Result<PidMap> {
-    LsofData::lsof(LsofFiletype::All, String::new()).map(|d| d.pid_to_files)
+pub fn lsof() -> Result<LsofData> {
+    LsofData::lsof(LsofFiletype::All, String::new())
 }
 ///get target info
 #[tracing::instrument(level = "info")]
