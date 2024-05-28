@@ -38,7 +38,11 @@ struct Args {
     group_fold: GroupFold,
 
     #[arg(short, long)]
-    count: bool,
+    total_count: bool,
+
+    /// Exclude listing empty groups
+    #[arg(short, long)]
+    exclude_empty: bool,
 
     #[arg(short, long, group = "filter")]
     file: Option<PathBuf>,
@@ -115,6 +119,15 @@ fn main() -> Result<()> {
         p.into_os_string().into_string().expect("")
     });
     let lsof_all = filetypes == Filetype::All && filename.is_empty();
+    let exclude_empty = args.exclude_empty;
+    let total_count = args.total_count;
+    let o = OutputArgs {
+        sort_by,
+        order,
+        group_fold,
+        total_count,
+        exclude_empty,
+    };
 
     // No longer access Cli Args
     #[allow(clippy::no_effect_underscore_binding)]
@@ -124,19 +137,27 @@ fn main() -> Result<()> {
     let lsof = if lsof_all {
         Data::lsof_all()?
     } else {
-        Data::lsof(filetypes, filename)?
+        Data::lsof(filetypes, &filename)?
     };
 
     let _g = info_span!("output");
     match group_by {
-        GroupBy::None => output(lsof, sort_by, order)?,
-        GroupBy::File => group_by_file(lsof, sort_by, order, group_fold)?,
-        GroupBy::Pid => group_by_pid(lsof, sort_by, order, group_fold)?,
-        GroupBy::Filetype => group_by_filetype(lsof, sort_by, order, group_fold)?,
-        GroupBy::ProcName => group_by_proc_name(lsof, sort_by, order, group_fold)?,
+        GroupBy::None => output(lsof, o)?,
+        GroupBy::File => group_by_file(lsof, o)?,
+        GroupBy::Pid => group_by_pid(lsof, o)?,
+        GroupBy::Filetype => group_by_filetype(lsof, o)?,
+        GroupBy::ProcName => group_by_proc_name(lsof, o)?,
     }
 
     Ok(())
+}
+
+struct OutputArgs {
+    sort_by: Sorting,
+    order: Ordering,
+    group_fold: GroupFold,
+    total_count: bool,
+    exclude_empty: bool,
 }
 
 fn tracing_subscriber() {
@@ -148,7 +169,7 @@ fn tracing_subscriber() {
 }
 
 #[tracing::instrument(skip(lsof), level = "info")]
-fn output(lsof: Data, sort_by: Sorting, order: Ordering) -> Result<()> {
+fn output(lsof: Data, OutputArgs { sort_by, order, .. }: OutputArgs) -> Result<()> {
     match sort_by {
         Sorting::NPids => bail!("Sorting by npids not implemented"),
         Sorting::NFiles => bail!("Sorting by nfiles not implemented"),
@@ -199,9 +220,13 @@ fn output(lsof: Data, sort_by: Sorting, order: Ordering) -> Result<()> {
 #[tracing::instrument(skip(lsof), level = "info")]
 fn group_by_file(
     lsof: Data,
-    sort_by: Sorting,
-    order: Ordering,
-    group_fold: GroupFold,
+    OutputArgs {
+        sort_by,
+        order,
+        group_fold,
+        total_count,
+        exclude_empty,
+    }: OutputArgs,
 ) -> Result<()> {
     let map = lsof.files_to_pid();
     match sort_by {
@@ -218,9 +243,13 @@ fn group_by_file(
 #[tracing::instrument(skip(lsof), level = "info")]
 fn group_by_pid(
     lsof: Data,
-    sort_by: Sorting,
-    order: Ordering,
-    group_fold: GroupFold,
+    OutputArgs {
+        sort_by,
+        order,
+        group_fold,
+        total_count,
+        exclude_empty,
+    }: OutputArgs,
 ) -> Result<()> {
     let map = lsof.into_pid_to_files();
     let map = fold_by_pid_w_count(map, |_, info| info.name);
@@ -261,9 +290,13 @@ fn group_by_pid(
 // #[tracing::instrument(skip(lsof), level = "info")]
 fn group_by_proc_name(
     lsof: Data,
-    sort_by: Sorting,
-    order: Ordering,
-    group_fold: GroupFold,
+    OutputArgs {
+        sort_by,
+        order,
+        group_fold,
+        total_count,
+        exclude_empty,
+    }: OutputArgs,
 ) -> Result<()> {
     let map = lsof.into_pid_to_files();
     let capacity = map.len();
@@ -333,6 +366,41 @@ fn group_by_proc_name(
     Ok(())
 }
 
+#[tracing::instrument(skip(lsof), level = "info")]
+fn group_by_filetype(
+    lsof: Data,
+    OutputArgs {
+        sort_by,
+        order,
+        group_fold,
+        total_count,
+        exclude_empty,
+    }: OutputArgs,
+) -> Result<()> {
+    todo!()
+}
+
+impl Display for Sorting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
+    }
+}
+impl Display for GroupBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
+    }
+}
+impl Display for Ordering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
+    }
+}
+impl Display for GroupFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
+    }
+}
+
 fn fold_by_proc_name_w_count<T: Copy>(
     map: impl IntoIterator<Item = (u64, ProcInfo)>,
     capacity: usize,
@@ -389,35 +457,5 @@ fn print_map<T>(order: Ordering, map: std::vec::IntoIter<T>, f: impl Fn(T)) {
             map.for_each(f);
         }
         Ordering::Descending => map.rev().for_each(f),
-    }
-}
-
-#[tracing::instrument(skip(lsof), level = "info")]
-fn group_by_filetype(
-    lsof: Data,
-    sort_by: Sorting,
-    order: Ordering,
-    group_fold: GroupFold,
-) -> Result<()> {
-    todo!()
-}
-impl Display for Sorting {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
-    }
-}
-impl Display for GroupBy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
-    }
-}
-impl Display for Ordering {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
-    }
-}
-impl Display for GroupFold {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{n}", n = self.to_possible_value().unwrap().get_name())
     }
 }
