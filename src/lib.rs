@@ -1,164 +1,252 @@
+#![warn(clippy::pedantic)]
 #![feature(const_trait_impl)]
 #![feature(hash_raw_entry)]
 use anyhow::{anyhow, Result};
 use glob::glob;
 use itertools::chain;
+use std::error::Error;
+use std::fmt::Display;
 use std::fs::read_to_string;
+use std::str::FromStr;
 use std::{fs, path::Component};
 
-pub type Filenames = FSet<String>;
-pub type PidMap = FMap<u64, Procinfo>;
+pub mod utils;
+pub use utils::*;
+
+// PERF: leak all the Strings for fun and profits
+// No more String
+
+#[derive(Clone)]
+pub struct Data {
+    // pid => info
+    pid_to_files: FMap<u64, ProcInfo>,
+    // file => pid
+    files_to_pid: FMap<String, FdInfo>,
+}
 
 #[derive(Default, Debug, Clone)]
-pub struct Fdinfo {
+pub struct Proc {
     pub pid: u64,
-    pub name: Option<String>,
-    pub files: Filenames,
+    pub info: ProcInfo,
 }
 #[derive(Default, Debug, Clone)]
-pub struct Procinfo {
-    name: Option<String>,
-    files: Filenames,
+pub struct ProcInfo {
+    pub name: Option<String>,
+    pub files: FSet<String>,
 }
-#[derive(PartialEq, Clone, Copy, Eq, Debug)]
-pub enum LsofFiletype {
-    Mem,
+#[derive(Default, Debug, Clone)]
+pub struct Fd {
+    pub info: FdInfo,
+    pub name: String,
+}
+#[derive(Default, Debug, Clone)]
+pub struct FdInfo {
+    pub pids: FSet<u64>, // PERF: can be Vec because small?
+}
+// TODO: bitflags
+#[derive(Default, PartialEq, Clone, Copy, Eq, Debug)]
+pub enum Filetype {
+    #[default]
     All,
-    Socket,
-}
-#[derive(Debug, Clone)]
-pub struct LsofData {
-    // pid => info
-    pid_to_files: PidMap,
-    // file => pid
-    files_to_pid: FMap<String, FSet<u64>>, // PERF: can be Vec because small?>
+    Mem,
+    Socket, // TODO: Not really used
+    File,   // TODO: Not really used
+    Extension(&'static str),
 }
 
 ///get all infomation
 #[tracing::instrument(level = "info")]
-pub fn lsof() -> Result<LsofData> {
-    LsofData::lsof(LsofFiletype::All, String::new())
+pub fn lsof() -> Result<Data> {
+    Data::lsof(Filetype::All, String::new())
 }
 ///get target info
 #[tracing::instrument(level = "info")]
-pub fn lsof_file(path: String) -> Result<Vec<Fdinfo>> {
+pub fn lsof_file(path: String) -> Result<Vec<Result<Proc, u64>>> {
     let metadata = fs::metadata(&path);
     //to do judge file type
     if let Ok(metadata) = metadata {
         let file_type = metadata.file_type();
-        println!("File type {:?}", file_type);
+        println!("File type {file_type:?}");
     }
 
-    let data = LsofData::lsof(LsofFiletype::All, path.clone())?;
+    let data = Data::lsof(Filetype::All, path.clone())?;
 
-    data.find(path)
+    data.find(&path)
 }
 ///get socket port used by process
 #[tracing::instrument(level = "info")]
-pub fn lsof_port(port: String) -> Result<Vec<Fdinfo>> {
-    let path = format!("socket:[{}]", port);
-    let data = LsofData::lsof(LsofFiletype::Socket, path.clone())?;
-    data.find(path)
+pub fn lsof_port(port: String) -> Result<Vec<Result<Proc, u64>>> {
+    let path = format!("socket:[{port}]");
+    let data = Data::lsof(Filetype::Socket, path.clone())?;
+    data.find(&path)
 }
 
-impl From<(u64, Procinfo)> for Fdinfo {
-    fn from((pid, Procinfo { name, files }): (u64, Procinfo)) -> Self {
-        Self { pid, name, files }
+impl From<(u64, ProcInfo)> for Proc {
+    fn from((pid, info): (u64, ProcInfo)) -> Self {
+        Self { pid, info }
     }
 }
-impl From<Fdinfo> for Procinfo {
-    fn from(
-        Fdinfo {
-            pid: _,
-            name,
-            files,
-        }: Fdinfo,
-    ) -> Self {
-        Self { name, files }
+impl From<Proc> for ProcInfo {
+    fn from(Proc { pid: _, info }: Proc) -> Self {
+        info
+    }
+}
+impl std::ops::Deref for Proc {
+    type Target = ProcInfo;
+    fn deref(&self) -> &Self::Target {
+        &self.info
+    }
+}
+impl From<(String, FdInfo)> for Fd {
+    fn from((name, info): (String, FdInfo)) -> Self {
+        Self { name, info }
+    }
+}
+impl From<Fd> for FdInfo {
+    fn from(Fd { name: _, info }: Fd) -> Self {
+        info
+    }
+}
+impl std::ops::Deref for Fd {
+    type Target = FdInfo;
+    fn deref(&self) -> &Self::Target {
+        &self.info
     }
 }
 
-impl Default for LsofData {
+impl Default for Data {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LsofFiletype {
+impl Filetype {
     const fn includes_mem(self) -> bool {
-        matches!(self, LsofFiletype::Mem) || matches!(self, LsofFiletype::All)
+        matches!(self, Filetype::Mem) || matches!(self, Filetype::All)
+    }
+    const fn includes_socket(self) -> bool {
+        matches!(self, Filetype::Socket) || matches!(self, Filetype::All)
+    }
+    const fn includes_file(self) -> bool {
+        matches!(self, Filetype::File) || matches!(self, Filetype::All)
     }
 }
 
-impl LsofData {
-    fn new() -> LsofData {
-        LsofData {
+impl Display for Filetype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Filetype::Extension(s) => write!(f, ".{s}"),
+            ft => write!(f, "{ft:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BadFiletypeStr;
+impl FromStr for Filetype {
+    type Err = BadFiletypeStr;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "" | "all" => Filetype::All,
+            "mem" => Filetype::Mem,
+            "socket" => Filetype::Socket,
+            "file" => Filetype::File,
+            s if s.starts_with('.') => Filetype::Extension(s.trim_start_matches('.').leak_str()),
+            _ => Err(BadFiletypeStr)?,
+        })
+    }
+}
+impl Error for BadFiletypeStr {}
+impl Display for BadFiletypeStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bad filetype arg")
+    }
+}
+
+impl Data {
+    pub fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Data")
+            .field("pid_to_files", &self.pid_to_files)
+            .field("files_to_pid", &self.files_to_pid)
+            .finish()
+    }
+
+    fn new() -> Data {
+        Data {
             pid_to_files: fmap(0),
             files_to_pid: fmap(0),
         }
     }
 
-    #[tracing::instrument(skip(self), level = "info")]
-    fn file_to_pid(&mut self, fname: &str, pid: u64) {
-        if true {
-            use std::collections::hash_map::RawEntryMut::*;
-            let entry = self.files_to_pid.raw_entry_mut().from_key(fname);
-            match entry {
-                Occupied(o) => {
-                    o.into_mut().insert(pid);
-                }
-                Vacant(v) => {
-                    v.insert(fname.to_owned(), [pid].into_iter().collect());
-                }
+    pub fn all(self) -> impl Iterator<Item = (u64, &'static str, String)> {
+        self.pid_to_files.into_iter().flat_map(|(pid, info)| {
+            let name = info.name.map_or("<noname>", StrLeakExt::leak_str);
+            info.files.into_iter().map(move |f| (pid, name, f))
+        })
+    }
+
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn file_to_pid_insert(&mut self, fname: &str, pid: u64) {
+        #[allow(clippy::enum_glob_use)]
+        use std::collections::hash_map::RawEntryMut::*;
+        let entry = self.files_to_pid.raw_entry_mut().from_key(fname);
+        match entry {
+            Occupied(o) => {
+                o.into_mut().pids.insert(pid);
             }
-        } else {
-            use std::collections::hash_map::Entry::*;
-            let entry = self.files_to_pid.entry(fname.to_owned());
-            match entry {
-                Occupied(o) => {
-                    o.into_mut().insert(pid);
-                }
-                Vacant(v) => {
-                    v.insert([pid].into_iter().collect());
-                }
-            };
+            Vacant(v) => {
+                v.insert(
+                    fname.to_owned(),
+                    FdInfo {
+                        pids: [pid].into_iter().collect(),
+                    },
+                );
+            }
         }
     }
 
     #[tracing::instrument(level = "info")]
-    pub fn lsof(target_filetype: LsofFiletype, target_filename: String) -> Result<LsofData> {
-        let mut data = LsofData::new();
+    pub fn lsof_all() -> Result<Data> {
+        // This should be inlined so that the target_* behaviour is completely removed
+        Self::lsof(Filetype::All, String::new())
+    }
+    #[tracing::instrument(level = "info")]
+    pub fn lsof(target_filetype: Filetype, target_filename: String) -> Result<Data> {
+        let mut data = Data::new();
+        // PERF: this glob can just be a read_dir
         let proc_paths = glob("/proc/*")?;
         // PERF: parallelize
         for proc in proc_paths {
             let proc = proc?;
-            let (pid_str, pid) = extract_pid_from_path(&proc);
+            let (_pid_str, pid) = extract_pid_from_path(&proc);
             let Ok(pid) = pid else {
                 continue;
             };
 
+            // ISSUE: These osstring conversions with unwrap are bad
             let proc_path_str = proc.into_os_string().into_string().unwrap();
 
             //get process other info
-            let other_info = get_pid_info(proc_path_str.clone() + "/status");
+            let other_info = get_pid_info(proc_path_str.clone());
             let name = other_info.get("Name").cloned();
 
             let (cap, files) = get_files_info(target_filetype, proc_path_str);
             let mut fileset = fset(cap.min(1));
             for file in files {
-                // PERF: this shared map is a blocker to parallelism
-                // Just extract it in a separate loop
+                // PERF: this shared map maybe a blocker to parallelism
+                // Just extract it in a separate loop?
                 if !target_filename.is_empty() && target_filename == file {
-                    data.file_to_pid(&target_filename, pid);
+                    data.file_to_pid_insert(&target_filename, pid);
                 } else {
-                    data.file_to_pid(&file, pid)
+                    data.file_to_pid_insert(&file, pid);
                 }
                 fileset.insert(file);
             }
 
             data.pid_to_files.insert(
                 pid,
-                Procinfo {
+                ProcInfo {
                     name,
                     files: fileset,
                 },
@@ -166,17 +254,51 @@ impl LsofData {
         }
         Ok(data)
     }
-    pub fn find(&self, path: String) -> Result<Vec<Fdinfo>> {
+
+    /// Description.
+    /// Find a certain file in the lsof data and return the Info of the processes
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: The file path to search for
+    /// * `argument_name` - type and description.
+    ///
+    /// # Returns
+    /// List of Processes opening this file, or an error if the path is not found
+    ///
+    /// # Errors
+    /// anyhow: path not found
+    ///
+    /// # Examples
+    /// ```rust
+    /// write me later
+    /// ```
+    pub fn find(&self, path: &str) -> Result<Vec<Result<Proc, u64>>> {
         let t = self
             .files_to_pid
-            .get(&path)
+            .get(path)
             .ok_or_else(|| anyhow!("{path} not found in lsof"))?;
         let result = t
+            .pids
             .iter()
-            .filter_map(|s| self.pid_to_files.get(s).map(|p| (*s, p.clone())))
-            .map(Into::into)
+            .map(|s| {
+                self.pid_to_files
+                    .get(s)
+                    .map(|p| (*s, p.clone()).into())
+                    .ok_or(*s)
+            })
             .collect();
         Ok(result)
+    }
+
+    #[must_use]
+    pub fn pid_to_files(&self) -> &FMap<u64, ProcInfo> {
+        &self.pid_to_files
+    }
+
+    #[must_use]
+    pub fn files_to_pid(&self) -> &FMap<String, FdInfo> {
+        &self.files_to_pid
     }
 }
 
@@ -193,9 +315,9 @@ fn extract_pid_from_path(
     (pid_str, pid)
 }
 
-#[tracing::instrument(level = "info")]
+#[tracing::instrument(level = "trace")]
 fn get_files_info(
-    target_filetype: LsofFiletype,
+    target_filetype: Filetype,
     proc_path_str: String,
 ) -> (usize, impl Iterator<Item = String> + 'static) {
     let meminfo = target_filetype
@@ -205,7 +327,7 @@ fn get_files_info(
         .flatten();
     let file = glob((proc_path_str + "/fd/*").as_str())
         .unwrap()
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|p| fs::read_link(p).ok())
         .map(|file| file.into_os_string().into_string().unwrap());
     let cap = meminfo.size_hint().0 + file.size_hint().0;
@@ -213,11 +335,13 @@ fn get_files_info(
     (cap, file)
 }
 
-#[tracing::instrument(level = "info")]
+#[tracing::instrument(level = "trace")]
 fn get_pid_info(path: String) -> FMap<String, String> {
+    let path = path + "/status";
     // TODO: better parser for this
     // can make this lazy because we only need "Name"
     // Also, parse to a struct
+    // also should use /stat/ because parsing
     let mut map: FMap<String, String> = fmap(0);
     if path.is_empty() {
         return map;
@@ -238,7 +362,7 @@ fn get_pid_info(path: String) -> FMap<String, String> {
     map
 }
 
-#[tracing::instrument(level = "info")]
+#[tracing::instrument(level = "trace")]
 fn get_mem_info(proc_path_str: String) -> Vec<String> {
     let path = proc_path_str + "/maps";
     let Ok(content) = read_to_string(path) else {
@@ -266,13 +390,3 @@ fn get_mem_info(proc_path_str: String) -> Vec<String> {
 // }
 #[cfg(test)]
 mod tests;
-
-use fxhash::{FxHashMap, FxHashSet};
-pub type FSet<T> = FxHashSet<T>;
-pub type FMap<K, V> = FxHashMap<K, V>;
-pub fn fmap<K, V>(cap: usize) -> FMap<K, V> {
-    FMap::with_capacity_and_hasher(cap, std::hash::BuildHasherDefault::default())
-}
-pub fn fset<V>(cap: usize) -> FSet<V> {
-    FSet::with_capacity_and_hasher(cap, std::hash::BuildHasherDefault::default())
-}
