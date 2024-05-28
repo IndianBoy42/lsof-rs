@@ -1,9 +1,12 @@
 #![warn(clippy::pedantic)]
 #![feature(const_trait_impl)]
 #![feature(hash_raw_entry)]
+#![feature(iter_collect_into)]
+#![feature(anonymous_lifetime_in_impl_trait)]
 use anyhow::{anyhow, Result};
 use glob::glob;
 use itertools::chain;
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::error::Error;
 use std::fmt::Display;
 use std::fs::read_to_string;
@@ -21,7 +24,7 @@ pub struct Data {
     // pid => info
     pid_to_files: FMap<u64, ProcInfo>,
     // file => pid
-    files_to_pid: FMap<String, FdInfo>,
+    files_to_pid: FMap<String, FdInfo>, // PERF: leak this
 }
 
 #[derive(Default, Debug, Clone)]
@@ -57,7 +60,7 @@ pub enum Filetype {
 ///get all infomation
 #[tracing::instrument(level = "info")]
 pub fn lsof() -> Result<Data> {
-    Data::lsof(Filetype::All, String::new())
+    Data::lsof(Filetype::All, "")
 }
 ///get target info
 #[tracing::instrument(level = "info")]
@@ -69,7 +72,7 @@ pub fn lsof_file(path: String) -> Result<Vec<Result<Proc, u64>>> {
         println!("File type {file_type:?}");
     }
 
-    let data = Data::lsof(Filetype::All, path.clone())?;
+    let data = Data::lsof(Filetype::All, &path)?;
 
     data.find(&path)
 }
@@ -77,7 +80,7 @@ pub fn lsof_file(path: String) -> Result<Vec<Result<Proc, u64>>> {
 #[tracing::instrument(level = "info")]
 pub fn lsof_port(port: String) -> Result<Vec<Result<Proc, u64>>> {
     let path = format!("socket:[{port}]");
-    let data = Data::lsof(Filetype::Socket, path.clone())?;
+    let data = Data::lsof(Filetype::Socket, &path)?;
     data.find(&path)
 }
 
@@ -206,70 +209,52 @@ impl Data {
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn file_to_pid_insert(&mut self, fname: &str, pid: u64) {
-        #[allow(clippy::enum_glob_use)]
-        use std::collections::hash_map::RawEntryMut::*;
-        let entry = self.files_to_pid.raw_entry_mut().from_key(fname);
-        match entry {
-            Occupied(o) => {
-                o.into_mut().pids.insert(pid);
-            }
-            Vacant(v) => {
-                v.insert(
-                    fname.to_owned(),
-                    FdInfo {
-                        pids: [pid].into_iter().collect(),
-                    },
-                );
-            }
-        }
+        let files_to_pid = &mut self.files_to_pid;
+        file_to_pid_insert(files_to_pid, fname, pid);
+    }
+    // #[tracing::instrument(skip(self, i), level = "trace")]
+    fn file_to_pid_extend(&mut self, i: impl IntoIterator<Item = (&str, u64)>) {
+        let files_to_pid = &mut self.files_to_pid;
+        file_to_pid_extend(files_to_pid, i);
     }
 
     #[tracing::instrument(level = "info")]
     pub fn lsof_all() -> Result<Data> {
         // This should be inlined so that the target_* behaviour is completely removed
-        Self::lsof(Filetype::All, String::new())
+        Self::lsof(Filetype::All, "")
     }
-    #[tracing::instrument(level = "info")]
-    pub fn lsof(target_filetype: Filetype, target_filename: String) -> Result<Data> {
+    // #[tracing::instrument(level = "info")]
+    pub fn lsof(target_filetype: Filetype, target_filename: &str) -> Result<Data> {
         let mut data = Data::new();
         // PERF: this glob can just be a read_dir
         let proc_paths = glob("/proc/*")?;
         // PERF: parallelize
-        for proc in proc_paths {
-            let proc = proc?;
-            let (_pid_str, pid) = extract_pid_from_path(&proc);
-            let Ok(pid) = pid else {
-                continue;
-            };
+        data.pid_to_files = proc_paths
+            .par_bridge()
+            .filter_map(|proc| {
+                let proc = proc.ok()?;
+                let (_pid_str, pid) = extract_pid_from_path(&proc);
+                Some((pid.ok()?, proc.into_os_string().into_string().unwrap()))
+            })
+            .map(|(pid, proc_path_str)| {
+                //get process other info
+                let other_info = get_pid_info(proc_path_str.clone());
+                let name = other_info.get("Name").cloned().map(StrLeakExt::leak_str);
 
-            // ISSUE: These pathbuf-osstring conversions with unwrap are bad?
-            let proc_path_str = proc.into_os_string().into_string().unwrap();
+                let (cap, files) = get_files_info(target_filetype, proc_path_str);
+                let mut fileset = fset(cap.min(1));
+                files.collect_into(&mut fileset);
 
-            //get process other info
-            let other_info = get_pid_info(proc_path_str.clone());
-            let name = other_info.get("Name").cloned().map(StrLeakExt::leak_str);
-
-            let (cap, files) = get_files_info(target_filetype, proc_path_str);
-            let mut fileset = fset(cap.min(1));
-            for file in files {
-                // PERF: this shared map may be a blocker to parallelism
-                // Just extract it in a separate loop?
-                if !target_filename.is_empty() && target_filename == file {
-                    data.file_to_pid_insert(&target_filename, pid);
-                } else {
-                    data.file_to_pid_insert(file, pid);
-                }
-                fileset.insert(file);
-            }
-
-            data.pid_to_files.insert(
-                pid,
-                ProcInfo {
-                    name,
-                    files: fileset,
-                },
-            );
-        }
+                (
+                    pid,
+                    ProcInfo {
+                        name,
+                        files: fileset,
+                    },
+                )
+            })
+            .collect();
+        data.invert_pid_to_files(target_filename);
         Ok(data)
     }
 
@@ -346,6 +331,53 @@ impl Data {
             pids.push(pid);
         }
         proc_to_files
+    }
+    fn invert_pid_to_files(&mut self, target_filename: &str) {
+        for (pid, info) in &self.pid_to_files {
+            let files = &info.files;
+            if target_filename.is_empty() {
+                file_to_pid_extend(
+                    &mut self.files_to_pid,
+                    files.iter().map(|file| (*file, *pid)),
+                );
+            } else {
+                file_to_pid_extend(
+                    &mut self.files_to_pid,
+                    files
+                        .iter()
+                        .filter(|&&file| target_filename == file)
+                        .map(|file| (*file, *pid)),
+                );
+            }
+        }
+    }
+}
+
+fn file_to_pid_extend(
+    files_to_pid: &mut FMap<String, FdInfo>,
+    i: impl IntoIterator<Item = (&str, u64)>,
+) {
+    let i = i.into_iter();
+    files_to_pid.reserve(i.size_hint().0);
+    i.for_each(|(name, pid)| file_to_pid_insert(files_to_pid, name, pid));
+}
+
+fn file_to_pid_insert(files_to_pid: &mut FMap<String, FdInfo>, fname: &str, pid: u64) {
+    #[allow(clippy::enum_glob_use)]
+    use std::collections::hash_map::RawEntryMut::*;
+    let entry = files_to_pid.raw_entry_mut().from_key(fname);
+    match entry {
+        Occupied(o) => {
+            o.into_mut().pids.insert(pid);
+        }
+        Vacant(v) => {
+            v.insert(
+                fname.to_owned(),
+                FdInfo {
+                    pids: [pid].into_iter().collect(),
+                },
+            );
+        }
     }
 }
 

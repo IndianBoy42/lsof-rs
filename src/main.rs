@@ -147,7 +147,7 @@ fn tracing_subscriber() {
         .init();
 }
 
-// #[tracing::instrument(skip(lsof), level = "info")]
+#[tracing::instrument(skip(lsof), level = "info")]
 fn output(lsof: Data, sort_by: Sorting, order: Ordering) -> Result<()> {
     match sort_by {
         Sorting::NPids => bail!("Sorting by npids not implemented"),
