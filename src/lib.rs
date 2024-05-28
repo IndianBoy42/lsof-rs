@@ -164,6 +164,27 @@ impl Display for BadFiletypeStr {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Entry {
+    pub pid: u64,
+    pub proc: &'static str,
+    pub file: &'static str,
+}
+impl Entry {
+    fn from((pid, proc): (u64, ProcInfo)) -> impl Iterator<Item = Self> {
+        let name = proc.name.map_or("<noname>", StrLeakExt::leak_str);
+        proc.files.into_iter().map(move |f| Self {
+            pid,
+            proc: name,
+            file: f.leak_str(),
+        })
+    }
+    #[must_use]
+    pub fn get_ext(&self) -> &'static str {
+        self.file.rsplit_once('.').unwrap_or((self.file, "")).1
+    }
+}
+
 impl Data {
     pub fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Data")
@@ -179,11 +200,8 @@ impl Data {
         }
     }
 
-    pub fn all(self) -> impl Iterator<Item = (u64, &'static str, String)> {
-        self.pid_to_files.into_iter().flat_map(|(pid, info)| {
-            let name = info.name.map_or("<noname>", StrLeakExt::leak_str);
-            info.files.into_iter().map(move |f| (pid, name, f))
-        })
+    pub fn flattened(self) -> impl Iterator<Item = Entry> {
+        self.pid_to_files.into_iter().flat_map(Entry::from)
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
@@ -229,7 +247,7 @@ impl Data {
 
             //get process other info
             let other_info = get_pid_info(proc_path_str.clone());
-            let name = other_info.get("Name").cloned();
+            let name = other_info.get("Name").cloned(); // TODO: get the full name
 
             let (cap, files) = get_files_info(target_filetype, proc_path_str);
             let mut fileset = fset(cap.min(1));
@@ -300,6 +318,35 @@ impl Data {
     pub fn files_to_pid(&self) -> &FMap<String, FdInfo> {
         &self.files_to_pid
     }
+
+    #[must_use]
+    pub fn proc_to_files(&self) -> FMap<String, (Vec<u64>, FSet<String>)> {
+        self.clone().into_proc_to_files()
+    }
+
+    #[must_use]
+    pub fn into_pid_to_files(self) -> FMap<u64, ProcInfo> {
+        self.pid_to_files
+    }
+
+    #[must_use]
+    pub fn into_files_to_pid(self) -> FMap<String, FdInfo> {
+        self.files_to_pid
+    }
+
+    #[must_use]
+    pub fn into_proc_to_files(self) -> FMap<String, (Vec<u64>, FSet<String>)> {
+        let map = self.into_pid_to_files();
+        let mut proc_to_files = fmap(map.len());
+        for (pid, ProcInfo { name, files }) in map {
+            let (pids, fileset) = proc_to_files
+                .entry(name.unwrap_or_else(|| pid.to_string()))
+                .or_insert_with(|| (vec![], fset(files.len())));
+            fileset.extend(files);
+            pids.push(pid);
+        }
+        proc_to_files
+    }
 }
 
 fn extract_pid_from_path(
@@ -328,7 +375,7 @@ fn get_files_info(
     let file = glob((proc_path_str + "/fd/*").as_str())
         .unwrap()
         .filter_map(std::result::Result::ok)
-        .filter_map(|p| fs::read_link(p).ok())
+        .map(|p| fs::read_link(p.clone()).unwrap_or(p)) // PERF: don't clone
         .map(|file| file.into_os_string().into_string().unwrap());
     let cap = meminfo.size_hint().0 + file.size_hint().0;
     let file = chain!(meminfo, file);

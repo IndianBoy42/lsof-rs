@@ -2,15 +2,16 @@
 // REMEMBER: lsof | cut -d " " -f 1 | sort | uniq -c | sort -n -r | head
 use anyhow::{anyhow, bail, Result};
 use itertools::Itertools;
-use lsof_rs::{Data, Filetype, StrLeakExt};
+use lsof::{fmap, fset, Data, FMap, FSet, Filetype, ProcInfo, StrLeakExt};
 use tracing::info_span;
 use tracing::level_filters::LevelFilter;
-use tracing_coz::TracingCozBridge;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
 use colored::Colorize;
+use std::cmp::Reverse;
 use std::fmt::Display;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -23,6 +24,7 @@ use clap::{arg, command, value_parser, ArgAction, Command, Parser, ValueEnum};
 struct Args {
     /// Sort the entries of lsof,
     /// if not given then it is inferred based on group_by
+    /// TODO: we should be able to sort by multiple
     #[arg(short, long)]
     sort_by: Option<Sorting>,
 
@@ -34,6 +36,9 @@ struct Args {
 
     #[arg(short = 'G', long, default_value_t, requires = "group_by")]
     group_fold: GroupFold,
+
+    #[arg(short, long)]
+    count: bool,
 
     #[arg(short, long, group = "filter")]
     file: Option<PathBuf>,
@@ -62,6 +67,7 @@ enum Sorting {
     ProcName,
     NPids,
     NFiles,
+    None,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Hash, ValueEnum)]
@@ -78,6 +84,7 @@ enum GroupBy {
     File,
     Pid,
     Filetype,
+    ProcName,
 }
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Hash, ValueEnum)]
 enum GroupFold {
@@ -87,12 +94,10 @@ enum GroupFold {
 }
 
 fn main() -> Result<()> {
-    // TODO: timing, tracy and coz
-    tracing_subscriber::registry()
-        .with(LevelFilter::INFO)
-        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::ACTIVE))
-        // .with(TracingCozBridge::new())
-        .init();
+    #[cfg(not(feature = "coz"))]
+    tracing_subscriber();
+    #[cfg(feature = "coz")]
+    tracing_coz::TracingCozBridge::new().init();
 
     let args = Args::parse();
 
@@ -103,6 +108,7 @@ fn main() -> Result<()> {
         GroupBy::None => Sorting::Filename,
         GroupBy::File => Sorting::NPids,
         GroupBy::Pid | GroupBy::Filetype => Sorting::NFiles,
+        GroupBy::ProcName => Sorting::NFiles,
     });
     let group_fold = args.group_fold;
     let filetypes = args.filetype;
@@ -128,31 +134,64 @@ fn main() -> Result<()> {
         GroupBy::File => group_by_file(lsof, sort_by, order, group_fold)?,
         GroupBy::Pid => group_by_pid(lsof, sort_by, order, group_fold)?,
         GroupBy::Filetype => group_by_filetype(lsof, sort_by, order, group_fold)?,
+        GroupBy::ProcName => group_by_proc_name(lsof, sort_by, order, group_fold)?,
     }
 
     Ok(())
 }
 
-#[tracing::instrument(skip(lsof), level = "info")]
+fn tracing_subscriber() {
+    tracing_subscriber::registry()
+        .with(LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::ACTIVE))
+        // .with(TracingCozBridge::new())
+        .init();
+}
+
+// #[tracing::instrument(skip(lsof), level = "info")]
 fn output(lsof: Data, sort_by: Sorting, order: Ordering) -> Result<()> {
     match sort_by {
         Sorting::NPids => bail!("Sorting by npids not implemented"),
         Sorting::NFiles => bail!("Sorting by nfiles not implemented"),
         _ => {}
     }
-    let mut all = lsof
-        .all()
-        .map(|(a, b, c)| (a, b, c.leak_str()))
-        .collect_vec();
-    match sort_by {
-        Sorting::Filename => all.sort_unstable_by_key(|(_, _, f)| *f),
-        Sorting::Pid => all.sort_unstable_by_key(|(p, _, _)| *p),
-        Sorting::Filetype => {
-            all.sort_unstable_by_key(|(_, _, f)| f.rsplit_once('.').unwrap_or((f, "")).1);
+    let mut all = lsof.flattened().collect_vec();
+    match (sort_by, order) {
+        (Sorting::Filename, Ordering::Ascending) => all.sort_unstable_by_key(|e| e.file),
+        (Sorting::Filename, Ordering::Descending) => all.sort_unstable_by_key(|e| Reverse(e.file)),
+        (Sorting::Pid, Ordering::Ascending) => all.sort_unstable_by_key(|e| e.pid),
+        (Sorting::Pid, Ordering::Descending) => all.sort_unstable_by_key(|e| Reverse(e.pid)),
+        (Sorting::Filetype, Ordering::Ascending) => {
+            all.sort_unstable_by_key(|e| e.get_ext());
         }
-        Sorting::ProcName => all.sort_unstable_by_key(|(_, name, _)| *name),
-        Sorting::NPids => unimplemented!(),
-        Sorting::NFiles => unimplemented!(),
+        (Sorting::Filetype, Ordering::Descending) => {
+            all.sort_unstable_by_key(|e| Reverse(e.get_ext()));
+        }
+        (Sorting::ProcName, Ordering::Ascending) => all.sort_unstable_by_key(|e| e.proc),
+        (Sorting::ProcName, Ordering::Descending) => all.sort_unstable_by_key(|e| Reverse(e.proc)),
+        (Sorting::NPids | Sorting::NFiles, _) => {
+            unreachable!("Handled above because we need to group")
+        }
+        (Sorting::None, _) => {}
+    }
+    for lsof::Entry { pid, proc, file } in all {
+        // TODO: prettify
+        let file = if sort_by == Sorting::Filename {
+            file.bold()
+        } else {
+            file.into()
+        };
+        let proc = if sort_by == Sorting::ProcName {
+            proc.bold()
+        } else {
+            proc.into()
+        };
+        let pid = if sort_by == Sorting::Pid {
+            pid.to_string().bold()
+        } else {
+            pid.to_string().into()
+        };
+        println!("{pid} {proc} {file}");
     }
 
     Ok(())
@@ -173,6 +212,7 @@ fn group_by_file(
         Sorting::ProcName => todo!(),
         Sorting::NPids => todo!(),
         Sorting::NFiles => bail!("Can't sort by # of files when grouping by file (its 1)"),
+        Sorting::None => todo!(),
     }
 }
 
@@ -193,7 +233,157 @@ fn group_by_pid(
         Sorting::ProcName => todo!(),
         Sorting::NPids => bail!("Can't sort by # of pids when grouping by pid (its 1)"),
         Sorting::NFiles => todo!(),
+        Sorting::None => todo!(),
     }
+}
+
+#[tracing::instrument(skip(lsof), level = "info")]
+fn group_by_proc_name(
+    lsof: Data,
+    sort_by: Sorting,
+    order: Ordering,
+    group_fold: GroupFold,
+) -> Result<()> {
+    let map = lsof.into_pid_to_files();
+    let len = map.len();
+
+    match sort_by {
+        Sorting::Filename => {
+            bail!("Can't sort by filename when grouping by pid (the filenames are folded)")
+        }
+        Sorting::Filetype => {
+            bail!("Can't sort by filetype when grouping by pid (the files are folded)")
+        }
+        Sorting::Pid => match group_fold {
+            GroupFold::Count => {
+                let map = map.into_iter().fold(
+                    fmap(len),
+                    |mut proc_to, (pid, ProcInfo { name, files })| {
+                        if !files.is_empty() {
+                            let (minpid, count) = proc_to
+                                .entry(name.unwrap_or_else(|| pid.to_string()))
+                                .or_insert((pid, 0));
+                            *minpid = (*minpid).min(pid);
+                            *count += files.len();
+                        }
+                        proc_to
+                    },
+                );
+                let map = map.into_iter().sorted_unstable_by_key(|(_, (pid, _))| *pid);
+                match order {
+                    Ordering::Ascending => {
+                        map.for_each(|(pname, (pid, nfiles))| println!("{pname} {pid} {nfiles}"));
+                    }
+                    Ordering::Descending => map
+                        .rev()
+                        .for_each(|(pname, (pid, nfiles))| println!("{pname} {pid} {nfiles}")),
+                }
+            }
+        },
+        Sorting::ProcName => match group_fold {
+            GroupFold::Count => {
+                let map = map.into_iter().fold(
+                    fmap(len),
+                    |mut proc_to, (pid, ProcInfo { name, files })| {
+                        if !files.is_empty() {
+                            let count = proc_to
+                                .entry(name.unwrap_or_else(|| pid.to_string()))
+                                .or_insert(0);
+                            *count += files.len();
+                        }
+                        proc_to
+                    },
+                );
+                let map = map
+                    .into_iter()
+                    .sorted_unstable_by_key(|(pname, _)| pname.clone());
+                match order {
+                    Ordering::Ascending => {
+                        map.for_each(|(pname, nfiles)| println!("{pname} {nfiles}"));
+                    }
+                    Ordering::Descending => map
+                        .rev()
+                        .for_each(|(pname, nfiles)| println!("{pname} {nfiles}")),
+                }
+            }
+        },
+        Sorting::NPids => match group_fold {
+            GroupFold::Count => {
+                let map = map.into_iter().fold(
+                    fmap(len),
+                    |mut proc_to, (pid, ProcInfo { name, files })| {
+                        if !files.is_empty() {
+                            let (pids, count) = proc_to
+                                .entry(name.unwrap_or_else(|| pid.to_string()))
+                                .or_insert((0, 0));
+                            *pids += 1;
+                            *count += files.len();
+                        }
+                        proc_to
+                    },
+                );
+                let map = map
+                    .into_iter()
+                    .sorted_unstable_by_key(|&(_, (pids, nfiles))| (pids, nfiles));
+                match order {
+                    Ordering::Ascending => {
+                        map.for_each(|(pname, (pids, nfiles))| println!("{pname} {pids} {nfiles}"));
+                    }
+                    Ordering::Descending => map
+                        .rev()
+                        .for_each(|(pname, (pids, nfiles))| println!("{pname} {pids} {nfiles}")),
+                }
+            }
+        },
+        Sorting::NFiles => match group_fold {
+            GroupFold::Count => {
+                let map = map.into_iter().fold(
+                    fmap(len),
+                    |mut proc_to, (pid, ProcInfo { name, files })| {
+                        if !files.is_empty() {
+                            let count = proc_to
+                                .entry(name.unwrap_or_else(|| pid.to_string()))
+                                .or_insert(0);
+                            *count += files.len();
+                        }
+                        proc_to
+                    },
+                );
+                let map = map
+                    .into_iter()
+                    .sorted_unstable_by_key(|(_, nfiles)| *nfiles);
+                match order {
+                    Ordering::Ascending => {
+                        map.for_each(|(pname, nfiles)| println!("{pname} {nfiles}"));
+                    }
+                    Ordering::Descending => map
+                        .rev()
+                        .for_each(|(pname, nfiles)| println!("{pname} {nfiles}")),
+                }
+            }
+        },
+        Sorting::None => match group_fold {
+            GroupFold::Count => {
+                let map = map.into_iter().fold(
+                    fmap(len),
+                    |mut proc_to, (pid, ProcInfo { name, files })| {
+                        if !files.is_empty() {
+                            let count = proc_to
+                                .entry(name.unwrap_or_else(|| pid.to_string()))
+                                .or_insert(0);
+                            *count += files.len();
+                        }
+                        proc_to
+                    },
+                );
+                for (pname, nfiles) in map {
+                    println!("{pname} {nfiles}");
+                }
+            }
+        },
+    };
+
+    Ok(())
 }
 
 #[tracing::instrument(skip(lsof), level = "info")]
