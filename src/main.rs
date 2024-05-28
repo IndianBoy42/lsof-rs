@@ -90,7 +90,7 @@ enum GroupBy {
 enum GroupFold {
     #[default]
     Count,
-    // TODO: what else?
+    // TODO: List, // Comma separated list of entries
 }
 
 fn main() -> Result<()> {
@@ -107,8 +107,7 @@ fn main() -> Result<()> {
     let sort_by = args.sort_by.unwrap_or(match group_by {
         GroupBy::None => Sorting::Filename,
         GroupBy::File => Sorting::NPids,
-        GroupBy::Pid | GroupBy::Filetype => Sorting::NFiles,
-        GroupBy::ProcName => Sorting::NFiles,
+        GroupBy::Pid | GroupBy::Filetype | GroupBy::ProcName => Sorting::NFiles,
     });
     let group_fold = args.group_fold;
     let filetypes = args.filetype;
@@ -223,21 +222,43 @@ fn group_by_pid(
     order: Ordering,
     group_fold: GroupFold,
 ) -> Result<()> {
-    let map = lsof.pid_to_files();
-    match sort_by {
+    let map = lsof.into_pid_to_files();
+    let map = fold_by_pid_w_count(map, |_, info| info.name);
+    let map = match sort_by {
         Sorting::Filename => {
             bail!("Can't sort by filename when grouping by pid (the filenames are folded)")
         }
-        Sorting::Pid => todo!(),
-        Sorting::Filetype => todo!(),
-        Sorting::ProcName => todo!(),
         Sorting::NPids => bail!("Can't sort by # of pids when grouping by pid (its 1)"),
-        Sorting::NFiles => todo!(),
-        Sorting::None => todo!(),
-    }
+        Sorting::Filetype => {
+            bail!("Can't sort by filetype when grouping by pid (the files are folded)")
+        }
+        Sorting::Pid => match group_fold {
+            GroupFold::Count => map.sorted_unstable_by_key(|(pid, _, _)| *pid),
+        },
+        Sorting::ProcName => match group_fold {
+            GroupFold::Count => map.sorted_unstable_by_key(|&(_, pname, _)| pname),
+        },
+        Sorting::NFiles => match group_fold {
+            GroupFold::Count => map.sorted_unstable_by_key(|(_, _, nfiles)| *nfiles),
+        },
+        Sorting::None => match group_fold {
+            GroupFold::Count => {
+                for (pid, pname, nfiles) in map {
+                    let pname = pname.unwrap_or("<noname>");
+                    println!("{pid} {pname} {nfiles}");
+                }
+                return Ok(());
+            }
+        },
+    };
+    print_map(order, map, |(pid, pname, nfiles)| {
+        let pname = pname.unwrap_or("<noname>");
+        println!("{pid} {pname} {nfiles}");
+    });
+    Ok(())
 }
 
-#[tracing::instrument(skip(lsof), level = "info")]
+// #[tracing::instrument(skip(lsof), level = "info")]
 fn group_by_proc_name(
     lsof: Data,
     sort_by: Sorting,
@@ -245,7 +266,7 @@ fn group_by_proc_name(
     group_fold: GroupFold,
 ) -> Result<()> {
     let map = lsof.into_pid_to_files();
-    let len = map.len();
+    let capacity = map.len();
 
     match sort_by {
         Sorting::Filename => {
@@ -256,127 +277,53 @@ fn group_by_proc_name(
         }
         Sorting::Pid => match group_fold {
             GroupFold::Count => {
-                let map = map.into_iter().fold(
-                    fmap(len),
-                    |mut proc_to, (pid, ProcInfo { name, files })| {
-                        if !files.is_empty() {
-                            let (minpid, count) = proc_to
-                                .entry(name.unwrap_or_else(|| pid.to_string()))
-                                .or_insert((pid, 0));
-                            *minpid = (*minpid).min(pid);
-                            *count += files.len();
-                        }
-                        proc_to
-                    },
+                let map = fold_by_proc_name_w_count(
+                    map,
+                    capacity,
+                    |pid, _| pid,
+                    |minpid, pid, _| minpid.min(pid),
                 );
                 let map = map.into_iter().sorted_unstable_by_key(|(_, (pid, _))| *pid);
-                match order {
-                    Ordering::Ascending => {
-                        map.for_each(|(pname, (pid, nfiles))| println!("{pname} {pid} {nfiles}"));
-                    }
-                    Ordering::Descending => map
-                        .rev()
-                        .for_each(|(pname, (pid, nfiles))| println!("{pname} {pid} {nfiles}")),
-                }
+                print_map(order, map, |(pname, (pid, nfiles))| {
+                    println!("{pname} {pid} {nfiles}");
+                });
             }
         },
         Sorting::ProcName => match group_fold {
             GroupFold::Count => {
-                let map = map.into_iter().fold(
-                    fmap(len),
-                    |mut proc_to, (pid, ProcInfo { name, files })| {
-                        if !files.is_empty() {
-                            let count = proc_to
-                                .entry(name.unwrap_or_else(|| pid.to_string()))
-                                .or_insert(0);
-                            *count += files.len();
-                        }
-                        proc_to
-                    },
-                );
-                let map = map
-                    .into_iter()
-                    .sorted_unstable_by_key(|(pname, _)| pname.clone());
-                match order {
-                    Ordering::Ascending => {
-                        map.for_each(|(pname, nfiles)| println!("{pname} {nfiles}"));
-                    }
-                    Ordering::Descending => map
-                        .rev()
-                        .for_each(|(pname, nfiles)| println!("{pname} {nfiles}")),
-                }
+                let map = fold_by_proc_name_w_count(map, capacity, |_, _| (), |(), _, _| ());
+                let map = map.into_iter().sorted_unstable_by_key(|&(pname, _)| pname);
+                print_map(order, map, |(pname, ((), nfiles))| {
+                    println!("{pname} {nfiles}");
+                });
             }
         },
         Sorting::NPids => match group_fold {
             GroupFold::Count => {
-                let map = map.into_iter().fold(
-                    fmap(len),
-                    |mut proc_to, (pid, ProcInfo { name, files })| {
-                        if !files.is_empty() {
-                            let (pids, count) = proc_to
-                                .entry(name.unwrap_or_else(|| pid.to_string()))
-                                .or_insert((0, 0));
-                            *pids += 1;
-                            *count += files.len();
-                        }
-                        proc_to
-                    },
-                );
+                let map = fold_by_proc_name_w_count(map, capacity, |_, _| 1, |i, _, _| i + 1);
                 let map = map
                     .into_iter()
                     .sorted_unstable_by_key(|&(_, (pids, nfiles))| (pids, nfiles));
-                match order {
-                    Ordering::Ascending => {
-                        map.for_each(|(pname, (pids, nfiles))| println!("{pname} {pids} {nfiles}"));
-                    }
-                    Ordering::Descending => map
-                        .rev()
-                        .for_each(|(pname, (pids, nfiles))| println!("{pname} {pids} {nfiles}")),
-                }
+                print_map(order, map, |(pname, (pids, nfiles))| {
+                    println!("{pname} {pids} {nfiles}");
+                });
             }
         },
         Sorting::NFiles => match group_fold {
             GroupFold::Count => {
-                let map = map.into_iter().fold(
-                    fmap(len),
-                    |mut proc_to, (pid, ProcInfo { name, files })| {
-                        if !files.is_empty() {
-                            let count = proc_to
-                                .entry(name.unwrap_or_else(|| pid.to_string()))
-                                .or_insert(0);
-                            *count += files.len();
-                        }
-                        proc_to
-                    },
-                );
+                let map = fold_by_proc_name_w_count(map, capacity, |_, _| (), |(), _, _| ());
                 let map = map
                     .into_iter()
                     .sorted_unstable_by_key(|(_, nfiles)| *nfiles);
-                match order {
-                    Ordering::Ascending => {
-                        map.for_each(|(pname, nfiles)| println!("{pname} {nfiles}"));
-                    }
-                    Ordering::Descending => map
-                        .rev()
-                        .for_each(|(pname, nfiles)| println!("{pname} {nfiles}")),
-                }
+                print_map(order, map, |(pname, ((), nfiles))| {
+                    println!("{pname} {nfiles}");
+                });
             }
         },
         Sorting::None => match group_fold {
             GroupFold::Count => {
-                let map = map.into_iter().fold(
-                    fmap(len),
-                    |mut proc_to, (pid, ProcInfo { name, files })| {
-                        if !files.is_empty() {
-                            let count = proc_to
-                                .entry(name.unwrap_or_else(|| pid.to_string()))
-                                .or_insert(0);
-                            *count += files.len();
-                        }
-                        proc_to
-                    },
-                );
-                for (pname, nfiles) in map {
+                let map = fold_by_proc_name_w_count(map, capacity, |_, _| (), |(), _, _| ());
+                for (pname, ((), nfiles)) in map {
                     println!("{pname} {nfiles}");
                 }
             }
@@ -384,6 +331,65 @@ fn group_by_proc_name(
     };
 
     Ok(())
+}
+
+fn fold_by_proc_name_w_count<T: Copy>(
+    map: impl IntoIterator<Item = (u64, ProcInfo)>,
+    capacity: usize,
+    init: impl Fn(u64, ProcInfo) -> T,
+    fold: impl Fn(T, u64, ProcInfo) -> T,
+) -> FMap<&'static str, (T, usize)> {
+    fold_pid_to_files_w_count(
+        map,
+        |pid, info| info.name.unwrap_or_else(|| pid.to_string().leak_str()),
+        capacity,
+        init,
+        fold,
+    )
+}
+fn fold_by_pid_w_count<T: Copy>(
+    map: impl IntoIterator<Item = (u64, ProcInfo)>,
+    f: impl Fn(u64, ProcInfo) -> T,
+) -> impl Iterator<Item = (u64, T, usize)> {
+    map.into_iter().map(move |(pid, info)| {
+        let len = info.files.len();
+        (pid, f(pid, info), len)
+    })
+}
+fn fold_pid_to_files_w_count<T: Copy, K: Eq + Hash>(
+    map: impl IntoIterator<Item = (u64, ProcInfo)>,
+    key: impl Fn(u64, &ProcInfo) -> K,
+    capacity: usize,
+    init: impl Fn(u64, ProcInfo) -> T,
+    fold: impl Fn(T, u64, ProcInfo) -> T,
+) -> FMap<K, (T, usize)> {
+    let map = map
+        .into_iter()
+        .fold(fmap(capacity), |mut proc_to, (pid, info)| {
+            // TODO: if !info.files.is_empty() {
+            match proc_to.entry(key(pid, &info)) {
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let (acc, count) = o.into_mut();
+                    *count += info.files.len();
+                    *acc = fold(*acc, pid, info);
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let len = info.files.len();
+                    v.insert((init(pid, info), len));
+                }
+            }
+            // }
+            proc_to
+        });
+    map
+}
+fn print_map<T>(order: Ordering, map: std::vec::IntoIter<T>, f: impl Fn(T)) {
+    match order {
+        Ordering::Ascending => {
+            map.for_each(f);
+        }
+        Ordering::Descending => map.rev().for_each(f),
+    }
 }
 
 #[tracing::instrument(skip(lsof), level = "info")]

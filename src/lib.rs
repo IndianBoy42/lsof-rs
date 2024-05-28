@@ -31,8 +31,8 @@ pub struct Proc {
 }
 #[derive(Default, Debug, Clone)]
 pub struct ProcInfo {
-    pub name: Option<String>,
-    pub files: FSet<String>,
+    pub name: Option<&'static str>,
+    pub files: FSet<&'static str>,
 }
 #[derive(Default, Debug, Clone)]
 pub struct Fd {
@@ -99,7 +99,7 @@ impl std::ops::Deref for Proc {
 }
 impl From<(String, FdInfo)> for Fd {
     fn from((name, info): (String, FdInfo)) -> Self {
-        Self { name, info }
+        Self { info, name }
     }
 }
 impl From<Fd> for FdInfo {
@@ -242,22 +242,22 @@ impl Data {
                 continue;
             };
 
-            // ISSUE: These osstring conversions with unwrap are bad
+            // ISSUE: These pathbuf-osstring conversions with unwrap are bad?
             let proc_path_str = proc.into_os_string().into_string().unwrap();
 
             //get process other info
             let other_info = get_pid_info(proc_path_str.clone());
-            let name = other_info.get("Name").cloned(); // TODO: get the full name
+            let name = other_info.get("Name").cloned().map(StrLeakExt::leak_str);
 
             let (cap, files) = get_files_info(target_filetype, proc_path_str);
             let mut fileset = fset(cap.min(1));
             for file in files {
-                // PERF: this shared map maybe a blocker to parallelism
+                // PERF: this shared map may be a blocker to parallelism
                 // Just extract it in a separate loop?
                 if !target_filename.is_empty() && target_filename == file {
                     data.file_to_pid_insert(&target_filename, pid);
                 } else {
-                    data.file_to_pid_insert(&file, pid);
+                    data.file_to_pid_insert(file, pid);
                 }
                 fileset.insert(file);
             }
@@ -320,7 +320,7 @@ impl Data {
     }
 
     #[must_use]
-    pub fn proc_to_files(&self) -> FMap<String, (Vec<u64>, FSet<String>)> {
+    pub fn proc_to_files(&self) -> FMap<&'static str, (Vec<u64>, FSet<&'static str>)> {
         self.clone().into_proc_to_files()
     }
 
@@ -335,12 +335,12 @@ impl Data {
     }
 
     #[must_use]
-    pub fn into_proc_to_files(self) -> FMap<String, (Vec<u64>, FSet<String>)> {
+    pub fn into_proc_to_files(self) -> FMap<&'static str, (Vec<u64>, FSet<&'static str>)> {
         let map = self.into_pid_to_files();
         let mut proc_to_files = fmap(map.len());
         for (pid, ProcInfo { name, files }) in map {
             let (pids, fileset) = proc_to_files
-                .entry(name.unwrap_or_else(|| pid.to_string()))
+                .entry(name.unwrap_or_else(|| pid.to_string().leak_str()))
                 .or_insert_with(|| (vec![], fset(files.len())));
             fileset.extend(files);
             pids.push(pid);
@@ -366,17 +366,24 @@ fn extract_pid_from_path(
 fn get_files_info(
     target_filetype: Filetype,
     proc_path_str: String,
-) -> (usize, impl Iterator<Item = String> + 'static) {
+) -> (usize, impl Iterator<Item = &'static str> + 'static) {
     let meminfo = target_filetype
         .includes_mem()
         .then(|| get_mem_info(proc_path_str.clone() + "/maps"))
         .into_iter()
         .flatten();
+    // PERF: this glob can just be a read_dir
     let file = glob((proc_path_str + "/fd/*").as_str())
         .unwrap()
         .filter_map(std::result::Result::ok)
-        .map(|p| fs::read_link(p.clone()).unwrap_or(p)) // PERF: don't clone
-        .map(|file| file.into_os_string().into_string().unwrap());
+        .map(|p| {
+            fs::read_link(&p)
+                .unwrap_or(p)
+                .into_os_string()
+                .into_string()
+                .unwrap()
+                .leak_str()
+        }); // PERF: don't clone
     let cap = meminfo.size_hint().0 + file.size_hint().0;
     let file = chain!(meminfo, file);
     (cap, file)
@@ -410,7 +417,7 @@ fn get_pid_info(path: String) -> FMap<String, String> {
 }
 
 #[tracing::instrument(level = "trace")]
-fn get_mem_info(proc_path_str: String) -> Vec<String> {
+fn get_mem_info(proc_path_str: String) -> Vec<&'static str> {
     let path = proc_path_str + "/maps";
     let Ok(content) = read_to_string(path) else {
         return Vec::new();
@@ -424,7 +431,7 @@ fn get_mem_info(proc_path_str: String) -> Vec<String> {
             else {
                 return None;
             };
-            (i >= 6 && !last.is_empty()).then(|| last.to_owned())
+            (i >= 6 && !last.is_empty()).then(|| last.leak_str())
         })
         .collect()
 }
