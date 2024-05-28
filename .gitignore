@@ -15,3 +15,7 @@ Cargo.lock
 
 profile.coz
 .coz/
+
+perf.data*
+.perf
+flamegraph.svg
