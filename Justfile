@@ -12,6 +12,6 @@ coz:
     coz run --- ./target/coz/lsof >/dev/null 2>&1
 
 flamegraph:
-    cargo flamegraph --bin lsof --freq 100000
+    cargo flamegraph --profile coz --features no_tracing --bin lsof -- --bench 100
     flamegraph --perfdata perf.data
     google-chrome flamegraph.svg

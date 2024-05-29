@@ -1,8 +1,8 @@
 #![warn(clippy::pedantic)]
 // REMEMBER: lsof | cut -d " " -f 1 | sort | uniq -c | sort -n -r | head
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use itertools::Itertools;
-use lsof::{fmap, fset, Data, FMap, FSet, Filetype, ProcInfo, StrLeakExt};
+use lsof::{fmap, Data, FMap, Filetype, ProcInfo, StrLeakExt};
 use tracing::info_span;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -16,14 +16,13 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::builder::TypedValueParser as _;
-use clap::{arg, command, value_parser, ArgAction, Command, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Debug)] // requires `derive` feature
 #[command(term_width = 0)] // Just to make testing across clap features easier
 struct Args {
     /// Sort the entries of lsof,
-    /// if not given then it is inferred based on group_by
+    /// if not given then it is inferred based on `group_by`
     /// TODO: we should be able to sort by multiple
     #[arg(short, long)]
     sort_by: Option<Sorting>,
@@ -37,7 +36,7 @@ struct Args {
     #[arg(short = 'G', long, default_value_t, requires = "group_by")]
     group_fold: GroupFold,
 
-    #[arg(short, long)]
+    #[arg(short = 'c', long)]
     total_count: bool,
 
     /// Exclude listing empty groups
@@ -53,12 +52,14 @@ struct Args {
     #[arg(short = 'P', long, group = "filter")]
     proc_regex: Option<String>,
 
-    #[clap( value_parser = Filetype::from_str)]
-    #[arg(short = 't', long, default_value = "")]
+    #[arg(short = 't', long, default_value = "",  value_parser = Filetype::from_str)]
     filetype: Filetype,
 
-    #[clap(skip)]
+    #[arg(skip)]
     invalidate: PhantomData<Box<()>>,
+
+    #[arg(default_value = "1", long)]
+    bench: usize,
 }
 
 // These should be
@@ -105,7 +106,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let _g = info_span!("argument processing");
+    let arg_proc_span = info_span!("argument processing");
     let order = args.order;
     let group_by = args.group_by;
     let sort_by = args.sort_by.unwrap_or(match group_by {
@@ -132,26 +133,34 @@ fn main() -> Result<()> {
     // No longer access Cli Args
     #[allow(clippy::no_effect_underscore_binding)]
     let _invalidate = args.invalidate;
-    drop(_g);
+    drop(arg_proc_span);
 
-    let lsof = if lsof_all {
-        Data::lsof_all()?
-    } else {
-        Data::lsof(filetypes, &filename)?
-    };
+    for i in 0..args.bench {
+        let lsof = if lsof_all {
+            Data::lsof_all()?
+        } else {
+            let mut data = Data::lsof(filetypes)?;
+            if !filename.is_empty() {
+                data.invert_pid_to_files(&filename);
+            }
+            data
+        };
 
-    let _g = info_span!("output");
-    match group_by {
-        GroupBy::None => output(lsof, o)?,
-        GroupBy::File => group_by_file(lsof, o)?,
-        GroupBy::Pid => group_by_pid(lsof, o)?,
-        GroupBy::Filetype => group_by_filetype(lsof, o)?,
-        GroupBy::ProcName => group_by_proc_name(lsof, o)?,
+        let _g = info_span!("output");
+        // PERF: all the time is in the printing
+        match group_by {
+            GroupBy::None => output(lsof, o)?,
+            GroupBy::File => group_by_file(lsof, o)?,
+            GroupBy::Pid => group_by_pid(lsof, o)?,
+            GroupBy::Filetype => group_by_filetype(lsof, o)?,
+            GroupBy::ProcName => group_by_proc_name(lsof, o)?,
+        }
     }
 
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 struct OutputArgs {
     sort_by: Sorting,
     order: Ordering,
