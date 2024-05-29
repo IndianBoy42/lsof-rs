@@ -17,6 +17,8 @@ macro_rules! bfmt {
     }};
 }
 
+use std::io::BufWriter;
+
 use fxhash::{FxHashMap, FxHashSet};
 pub type FSet<T> = FxHashSet<T>;
 pub type FMap<K, V> = FxHashMap<K, V>;
@@ -27,4 +29,8 @@ pub fn fmap<K, V>(cap: usize) -> FMap<K, V> {
 #[must_use]
 pub fn fset<V>(cap: usize) -> FSet<V> {
     FSet::with_capacity_and_hasher(cap, std::hash::BuildHasherDefault::default())
+}
+
+pub fn buf_stdout<'a>(all: impl ExactSizeIterator) -> BufWriter<std::io::StdoutLock<'a>> {
+    BufWriter::with_capacity((all.len() * 80 / 8).min(8192), std::io::stdout().lock())
 }
